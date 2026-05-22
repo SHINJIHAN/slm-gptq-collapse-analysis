@@ -1,0 +1,17 @@
+00_Base_Models/**
+01_cuda_misaligned/**
+02_cuda_aligned/**
+03_Evaluation_Datasets/**
+
+!00_Base_Models/download_base_models.py
+
+!02_cuda_aligned/01_quantize_pipeline_gptqmodel.py
+!02_cuda_aligned/02_evaluate_perplexity_gptq.py
+!02_cuda_aligned/03_auto_evaluate_ppl.py
+!02_cuda_aligned/04_baseline_ppl_evaluation.py
+!02_cuda_aligned/05_controlled_inference_eval.py
+
+!03_Evaluation_Datasets/eval_datasets.py
+!03_Evaluation_Datasets/hellaswag_eval.py
+
+.env
