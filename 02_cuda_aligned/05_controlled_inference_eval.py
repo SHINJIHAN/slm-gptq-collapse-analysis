@@ -13,7 +13,15 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR) # 02_cuda_aligned의 상위 폴더
 BASE_MODELS_DIR = os.path.join(PROJECT_ROOT, "00_Base_Models")
 QUANT_MODELS_DIR = SCRIPT_DIR                            # 양자화 모델은 스크립트와 동일 폴더
-SAVE_BASE_DIR = os.path.join(SCRIPT_DIR, "Experiment_Data")
+SAVE_BASE_DIR = os.path.join(SCRIPT_DIR, "Experiment_Data_v2")
+
+# ==============================================================================
+# [v2 추가] 모듈별 출력(attention / MLP) 저장 토글
+#   - True  : residual stream(기존) + attn_output + mlp_output 모두 저장 (분석 풀셋)
+#   - 저장 dtype은 BF16 원본 충실성 유지를 위해 기존과 동일하게 float32로 .pt 저장.
+#     (요청: BF16 계산 충실성 + 가능한 모든 텐서 저장)
+# ==============================================================================
+SAVE_MODULE_OUTPUTS = True
 
 EXPERIMENT_CONFIGS = [
     {
@@ -229,6 +237,60 @@ def reset_environment(seed: int = BASE_SEED) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+# ==============================================================================
+# [v2 추가] 모듈별(attention / MLP) 출력 캡처용 forward hook
+# ==============================================================================
+def locate_decoder_layers(model):
+    """
+    Llama-3.2 / Qwen2.5 / TinyLlama 는 모두 표준 구조를 따른다:
+        model.model.layers[i].self_attn   (어텐션 블록, o_proj 직후 출력)
+        model.model.layers[i].mlp         (MLP 블록, down_proj 직후 출력)
+    구조가 다르면 즉시 멈춰서 잘못된 위치에 hook 거는 것을 방지한다.
+    반환: layers (nn.ModuleList)
+    """
+    decoder = getattr(model, "model", model)
+    if not hasattr(decoder, "layers"):
+        raise RuntimeError(
+            "디코더 레이어 경로(model.model.layers)를 찾을 수 없습니다. "
+            "print(model) 로 구조를 확인하고 locate_decoder_layers를 수정하세요."
+        )
+    layers = decoder.layers
+    sample = layers[0]
+    if not (hasattr(sample, "self_attn") and hasattr(sample, "mlp")):
+        raise RuntimeError(
+            "레이어에 self_attn / mlp 속성이 없습니다. 실제 모듈명을 확인하세요: "
+            f"{[n for n, _ in sample.named_children()]}"
+        )
+    return layers
+
+
+def register_module_capture_hooks(model):
+    """
+    각 디코더 레이어의 self_attn 출력과 mlp 출력을 forward hook으로 가로채 저장.
+    hook은 '읽기 전용'으로 텐서를 detach→cpu→float32 복사만 하므로
+    모델 연산·시드·생성 결과에 일절 영향을 주지 않는다(재현성 보존).
+    반환: (captured, handles)
+       captured["attn"][i] : i번째 디코더 레이어 어텐션 출력 [1, seq, hidden]
+       captured["mlp"][i]  : i번째 디코더 레이어 MLP 출력      [1, seq, hidden]
+    """
+    captured = {"attn": {}, "mlp": {}}
+    handles = []
+    layers = locate_decoder_layers(model)
+
+    def make_hook(store, idx):
+        def hook(module, inputs, output):
+            # self_attn은 (hidden, attn_weights, past_kv) 튜플을 반환할 수 있음.
+            # mlp는 보통 텐서. 양쪽 모두 첫 요소가 hidden state.
+            t = output[0] if isinstance(output, tuple) else output
+            store[idx] = t.detach().to("cpu", dtype=torch.float32)
+        return hook
+
+    for i, layer in enumerate(layers):
+        handles.append(layer.self_attn.register_forward_hook(make_hook(captured["attn"], i)))
+        handles.append(layer.mlp.register_forward_hook(make_hook(captured["mlp"], i)))
+    return captured, handles
 
 
 def build_teacher_forcing_mask(generated_ids: torch.Tensor,
@@ -540,12 +602,22 @@ def evaluate_model(evaluate_original_model: bool, config: dict,
             ).to(model.device)
 
             with torch.no_grad():
+                # [v2] forward 직전에 모듈 hook 부착 (읽기 전용, 재현성 무영향)
+                if SAVE_MODULE_OUTPUTS:
+                    captured, hook_handles = register_module_capture_hooks(model)
+                else:
+                    captured, hook_handles = None, []
+
                 forward_outputs = model(
                     full_generated_ids,
                     attention_mask=tf_attention_mask,
                     output_hidden_states=True,
                     return_dict=True,
                 )
+
+                # [v2] forward 직후 즉시 hook 해제 (다음 프롬프트로 누수 방지)
+                for _h in hook_handles:
+                    _h.remove()
 
             hidden_states = forward_outputs.hidden_states
             tensor_metadata = []
@@ -600,6 +672,48 @@ def evaluate_model(evaluate_original_model: bool, config: dict,
                     "dim_max_abs_value": float(dim_mean_abs.max().item()),
                     "dim_max_abs_index": int(dim_mean_abs.argmax().item()),
                 })
+
+                # ── [v2] 모듈별(attention/MLP) 출력 저장 ──
+                # hidden_states는 [embedding, dec0_out, dec1_out, ...] 순서이므로
+                # hidden_states[layer_idx]의 디코더 레이어 인덱스는 (layer_idx - 1).
+                # layer_idx == 0 은 임베딩 출력이라 대응 모듈이 없음 → 건너뜀.
+                if SAVE_MODULE_OUTPUTS and captured is not None:
+                    dec_idx = layer_idx - 1
+                    if dec_idx >= 0 and dec_idx in captured["attn"]:
+                        attn_t = captured["attn"][dec_idx]   # [1, seq, hidden]
+                        mlp_t = captured["mlp"][dec_idx]
+                        # 인덱스 정합 검증: 모듈 출력 shape == residual stream shape
+                        # (한 칸이라도 어긋나면 분석 전체가 무의미해지므로 강하게 검증)
+                        assert attn_t.shape == tensor_cpu.shape, (
+                            f"[{experiment_id}/{prompt_id}] attn shape {tuple(attn_t.shape)} "
+                            f"!= hidden {tuple(tensor_cpu.shape)} (dec_idx={dec_idx})"
+                        )
+                        assert mlp_t.shape == tensor_cpu.shape, (
+                            f"[{experiment_id}/{prompt_id}] mlp shape {tuple(mlp_t.shape)} "
+                            f"!= hidden {tuple(tensor_cpu.shape)} (dec_idx={dec_idx})"
+                        )
+                        torch.save(attn_t, os.path.join(
+                            tensors_dir, f"layer_{dec_idx}_attn_output.pt"))
+                        torch.save(mlp_t, os.path.join(
+                            tensors_dir, f"layer_{dec_idx}_mlp_output.pt"))
+                        tensor_metadata.append({
+                            "decoder_layer": dec_idx,
+                            "attn_file": f"layer_{dec_idx}_attn_output.pt",
+                            "mlp_file": f"layer_{dec_idx}_mlp_output.pt",
+                            "maps_to_hidden_index": layer_idx,
+                        })
+                        # 모듈별 요약 통계도 함께 (분석 시 텐서 재로드 없이 활용)
+                        ta = attn_t[0]
+                        tm = mlp_t[0]
+                        layer_statistics.append({
+                            "module_for_decoder_layer": dec_idx,
+                            "attn_global_l2_norm": float(ta.norm().item()),
+                            "attn_token_l2_last": float(ta.norm(dim=-1)[-1].item()),
+                            "mlp_global_l2_norm": float(tm.norm().item()),
+                            "mlp_token_l2_last": float(tm.norm(dim=-1)[-1].item()),
+                        })
+                        del attn_t, mlp_t, ta, tm
+
                 del tensor_cpu, t, token_l2, dim_mean_abs, dim_l2
 
             # 레이어 통계는 별도 JSON으로 저장 (분석 스크립트가 텐서 없이 바로 사용)
@@ -654,6 +768,10 @@ def evaluate_model(evaluate_original_model: bool, config: dict,
             del inputs, input_ids, attention_mask
             del full_generated_ids, generated_ids, generated_text
             del forward_outputs, hidden_states, tf_attention_mask
+            if captured is not None:
+                captured["attn"].clear()
+                captured["mlp"].clear()
+                del captured
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
